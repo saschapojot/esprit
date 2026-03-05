@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- 1. Simulation Parameters ---
-M = 10              # Number of antenna elements
+M = 4              # Number of antenna elements
 K = 2              # Number of signal sources
 N = 1000           # Number of snapshots (time samples)
 wavelength = 1.0   # Lambda
