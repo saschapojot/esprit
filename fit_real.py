@@ -131,7 +131,7 @@ t = np.arange(M) * dt
 # Ground Truth Values
 true_lambdas = np.array([0.5, 1.2])
 true_amplitudes = np.array([1.0, 0.5])
-K = len(true_lambdas)
+K =3# len(true_lambdas)
 
 # Generate Signal
 signal_clean = np.zeros(M, dtype=complex)
@@ -163,8 +163,7 @@ est_amplitudes = est_amplitudes[idx]
 print("Estimated Results:")
 for i in range(K):
     print(f"Component {i+1}:")
-    print(f"  Lambda: {est_lambdas[i].real:.4f} + {est_lambdas[i].imag:.4f}j  (True: {true_lambdas[i]})")
-    print(f"  Amp:    {est_amplitudes[i].real:.4f} + {est_amplitudes[i].imag:.4f}j  (True: {true_amplitudes[i]})")
+    print(f"  Amp:    {est_amplitudes[i].real:.4f} + {est_amplitudes[i].imag:.4f}j ")
 
 # 4. Visualization
 plt.figure(figsize=(10, 6))
