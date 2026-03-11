@@ -36,6 +36,14 @@ def esprit(y, K, dx):
     # 5. Eigenvalues give the poles
     Z = np.linalg.eigvals(Psi)
 
+    # --- NEW: Print the K largest eigenvalues by magnitude ---
+    # Sort by absolute value in descending order
+    Z_sorted = Z[np.argsort(-np.abs(Z))]
+    print(f"  [ESPRIT] K={K} Eigenvalues (sorted by magnitude):")
+    for i, val in enumerate(Z_sorted):
+        print(f"    {i+1}: {val.real:+.6f} {val.imag:+.6f}j  (mag: {np.abs(val):.6f})")
+    # ---------------------------------------------------------
+
     # 6. Convert poles to continuous rates
     t = np.log(Z) / dx
 
@@ -111,8 +119,8 @@ print("============================================================\n")
 
 print("--- Sweep over K ---")
 print(f"{'K':<5} {'xc_est':<12} {'gamma_est':<12} {'c_est':<12} {'RMS':<12}")
-
-best_K = 3
+K_end=10
+best_K = 4
 best_f_recon = None
 best_df_recon = None
 best_c_est = None
@@ -120,10 +128,10 @@ best_xc_est = None
 best_gamma_est = None
 
 # Sweep K from 2 to 6
-for K in range(2, 7):
+for K in range(2, K_end):
     try:
         xc_est, gamma_est, c_est, f_recon, df_recon, rms = fit_singularity(x, y, K)
-        print(f"{K:<5} {xc_est:<12.6f} {gamma_est:<12.6f} {c_est:<12.6f} {rms:<12.2e}")
+        print(f"{K:<5} {xc_est:<12.6f} {gamma_est:<12.6f} {c_est:<12.6f} {rms:<12.2e}\n")
         if K == best_K:
             best_f_recon = f_recon
             best_df_recon = df_recon
@@ -131,7 +139,7 @@ for K in range(2, 7):
             best_xc_est = xc_est
             best_gamma_est = gamma_est
     except Exception as e:
-        print(f"{K:<5} FAILED: {e}")
+        print(f"{K:<5} FAILED: {e}\n")
 
 # --- Plotting ---
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
