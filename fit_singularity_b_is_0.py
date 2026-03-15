@@ -3,181 +3,288 @@ import matplotlib.pyplot as plt
 import scipy.linalg
 from scipy.signal import savgol_filter
 
+
 def generate_data(x, xc, gamma, c, A=1.0, sigma=0.001):
     """Generate power-law singularity data with noise."""
     y_exact = A * (xc - x)**(-gamma) + c
     noise = np.random.normal(0, sigma, size=len(x))
     return y_exact + noise
 
+
+def make_tridiag_C0(n):
+    """
+    Build the n×n tridiagonal noise-covariance kernel C_0 (Eq. 285):
+        C_0 = tridiag(-1, 2, -1)
+    arising from the differenced noise  η_m = ε(x_{m+1}) - ε(x_m).
+    """
+    return 2.0 * np.eye(n) - np.eye(n, k=1) - np.eye(n, k=-1)
+
+
 def esprit(y, K, dx):
     """
-    Standard ESPRIT algorithm to fit y as a sum of K exponentials.
-    Returns the exponential rates (t) and complex weights (w).
+    Noise-whitened TLS-ESPRIT following Section E.
+
+    The input y contains the differenced data
+        g_m = f(x_{m+1}) - f(x_m),   m = 0, …, N-1       (Eq. 276)
+    whose signal part is  Σ_j  W_j exp(t_j m Δx)  and whose noise
+    η_m = ε(x_{m+1}) - ε(x_m) has covariance  σ² C_0  with
+    C_0 = tridiag(-1, 2, -1).
+
+    Algorithm
+    ---------
+    1.  Cholesky-factorise C_0 = A A^T  (Eq. 286)
+    2.  Build Hankel matrix H from g_m  (Eq. 279)
+    3.  Whiten each column  h̃_m = A^{-1} h_m  (Eq. 295)
+    4.  Form whitened covariance  R̃ = (1/P) Σ h̃_m h̃_m^T  (Eq. 297)
+    5.  Eigen-decompose R̃ = Ũ Λ̃ Ũ†  (Eq. 298)
+    6.  Un-whiten  U = A Ũ  (Eq. 302)
+    7.  Signal subspace U_s (first K columns of U)  (Eq. 304)
+    8.  Partition U_s into U_{s1}, U_{s2}  (Eqs. 310-311)
+    9.  TLS-ESPRIT: SVD of [U_{s1}, U_{s2}], extract Ψ_TLS  (Eqs. 315-324)
+    10. Eigenvalues of Ψ_TLS → rates  t_j = log(μ_j)/Δx  (Eq. 326)
+    11. Whitened OLS for weights W_j  (Eqs. 331-341)
+
+    Parameters
+    ----------
+    y  : real array, shape (N,)
+         Differenced data g_m.  N = M-1  where M = number of data points.
+    K  : int
+         Number of exponential components to extract.
+    dx : float
+         Uniform spacing  Δx  between original sample points.
+
+    Returns
+    -------
+    t : complex array, shape (K,)
+        Exponential rates.
+    W : complex array, shape (K,)
+        Weights in  g_m = Σ_j W_j exp(t_j m Δx).
     """
     N = len(y)
-    L = N // 2  # Pencil parameter (half the data length is usually optimal)
+    L = N // 2                                      # Hankel row dimension
+    P = N + 1 - L                                   # Hankel col dimension (Eq. 278: P = M - L)
 
-    # 1. Build Hankel matrix
-    H = np.zeros((L, N - L + 1), dtype=complex)
-    for i in range(L):
-        H[i, :] = y[i:i + N - L + 1]
+    assert K < L and L < N - K, (
+        f"Need K < L < N-K, got K={K}, L={L}, N-K={N-K}")
 
-    # 2. SVD
-    U, S, Vh = scipy.linalg.svd(H, full_matrices=False)
-    Us = U[:, :K]
+    # ==================================================================
+    # Step 1  –  Cholesky of L×L noise covariance  (Eq. 286)
+    #            C_0^{(L)} = A_L  A_L^T
+    # ==================================================================
+    C0_L = make_tridiag_C0(L)
+    A_L = scipy.linalg.cholesky(C0_L, lower=True)
 
-    # 3. Shift matrices
-    U1 = Us[:-1, :]
-    U2 = Us[1:, :]
+    # ==================================================================
+    # Step 2  –  Hankel matrix  H ∈ R^{L×P}  (Eq. 279)
+    #            H[i, s] = g_{i+s}
+    # ==================================================================
+    H = np.zeros((L, P))
+    for s in range(P):
+        H[:, s] = y[s:s + L]
 
-    # 4. Solve for rotation matrix Psi (Total Least Squares / Pseudo-inverse)
-    Psi = np.linalg.pinv(U1) @ U2
+    # ==================================================================
+    # Step 3  –  Whiten each column:  h̃_s = A_L^{-1} h_s  (Eq. 295)
+    # ==================================================================
+    H_white = scipy.linalg.solve_triangular(A_L, H, lower=True)
 
-    # 5. Eigenvalues give the poles
-    Z = np.linalg.eigvals(Psi)
+    # ==================================================================
+    # Step 4  –  Whitened covariance  R̃ = (1/P) Σ_s h̃_s h̃_s^T  (Eq. 297)
+    # ==================================================================
+    R_tilde = (1.0 / P) * (H_white @ H_white.T)
 
-    # --- NEW: Print the K largest eigenvalues by magnitude ---
-    # Sort by absolute value in descending order
-    Z_sorted = Z[np.argsort(-np.abs(Z))]
+    # ==================================================================
+    # Step 5  –  Eigen-decompose  R̃ = Ũ Λ̃ Ũ†  (Eq. 298)
+    #            eigenvalues in *decreasing* order  (Eq. 300)
+    # ==================================================================
+    eigvals, U_tilde = np.linalg.eigh(R_tilde)
+    idx = np.argsort(-eigvals)
+    eigvals = eigvals[idx]
+    U_tilde = U_tilde[:, idx]
+    print(f"eigvals[:K]={eigvals[:K]}")
+    # ==================================================================
+    # Step 6  –  Un-whiten:  U = A_L  Ũ  (Eq. 302)
+    # ==================================================================
+    U_mat = A_L @ U_tilde
+
+    # ==================================================================
+    # Step 7  –  Signal subspace  U_s  (first K columns)  (Eq. 304)
+    # ==================================================================
+    Us = U_mat[:, :K]
+
+    # ==================================================================
+    # Step 8  –  Partition U_s  (Eqs. 310-311)
+    #            U_{s1} = first L-1 rows,   U_{s2} = last L-1 rows
+    #            shift-invariance:  U_{s2} = U_{s1} Ψ   (Eq. 313)
+    # ==================================================================
+    Us1 = Us[:-1, :]                                # (L-1) × K
+    Us2 = Us[1:, :]                                 # (L-1) × K
+
+    # ==================================================================
+    # Step 9  –  TLS-ESPRIT  (Eqs. 315-324)
+    #   U_xy = [U_{s1}, U_{s2}]  ∈ C^{(L-1)×2K}
+    #   SVD:  U_xy = V^L  Σ  (V^R)†              (Eq. 317)
+    #   Partition V^R into 4  K×K  blocks         (Eq. 321)
+    #   Ψ_TLS = -V^R_{01} (V^R_{11})^{-1}        (Eq. 324)
+    # ==================================================================
+    Uxy = np.hstack([Us1, Us2])                     # (L-1) × 2K
+
+    _, _, Vh = scipy.linalg.svd(Uxy, full_matrices=False)
+    # numpy convention:  Uxy = U_svd  diag(s)  Vh
+    # document:          Uxy = V^L    Σ        (V^R)†
+    # so  V^R = Vh^H
+    VR = Vh.conj().T                                # 2K × 2K
+
+    V01 = VR[:K, K:]                                # top-right    K × K
+    V11 = VR[K:, K:]                                # bottom-right K × K
+
+    Psi_TLS = -V01 @ np.linalg.inv(V11)             # (Eq. 324)
+
+    # ==================================================================
+    # Step 10  –  Eigenvalues → rates  (Eqs. 325-326)
+    #             t_j = log(μ_j) / Δx
+    # ==================================================================
+    mu = np.linalg.eigvals(Psi_TLS)
+    t = np.log(np.abs(mu)) / dx
+
+    mu_sorted = mu[np.argsort(-np.abs(mu))]
     print(f"  [ESPRIT] K={K} Eigenvalues (sorted by magnitude):")
-    for i, val in enumerate(Z_sorted):
-        print(f"    {i+1}: {val.real:+.6f} {val.imag:+.6f}j  (mag: {np.abs(val):.6f})")
-    # ---------------------------------------------------------
+    for i, val in enumerate(mu_sorted):
+        print(f"    {i+1}: {val.real:+.6f} {val.imag:+.6f}j  "
+              f"(mag: {np.abs(val):.6f})")
 
-    # 6. Convert poles to continuous rates
-    t = np.log(Z) / dx
+    # ==================================================================
+    # Step 11  –  Whitened OLS for weights W  (Eqs. 331-341)
+    #   G[m, j] = exp(t_j · m · Δx),  m = 0, …, N-1        (Eq. 332)
+    #   C_0^{(N)} of size N  →  Cholesky A_f
+    #   G̃ = A_f^{-1} G,   g̃ = A_f^{-1} g                  (Eqs. 338-339)
+    #   W = (G̃^T G̃)^{-1} G̃^T g̃                           (Eq. 341)
+    # ==================================================================
+    m_idx = np.arange(N)
+    G = np.exp(np.outer(m_idx, t * dx))             # N × K  (complex)
 
-    # 7. Solve for weights using linear least squares
-    x_idx = np.arange(N) * dx
-    V = np.exp(np.outer(x_idx, t))
-    w = np.linalg.lstsq(V, y, rcond=None)[0]
+    C0_N = make_tridiag_C0(N)
+    A_f = scipy.linalg.cholesky(C0_N, lower=True)
 
-    return t, w
+    g_tilde = scipy.linalg.solve_triangular(
+        A_f, y.astype(complex), lower=True)
+    G_tilde = scipy.linalg.solve_triangular(
+        A_f, G, lower=True)
 
-def fit_singularity(x_data, y_data, K):
+    W = np.linalg.lstsq(G_tilde, g_tilde, rcond=None)[0]
+
+    return t, W
+
+
+def reconstruct_f(x_data, y_data, K):
     """
-    Fits f(x) = c + A*(xc - x)^(-gamma) using ESPRIT + Linear Regression.
+    Reconstruct f(x) = sum_j a_j exp(t_j (x - x0)) + c  using ESPRIT
+    on the differenced, smoothed data.
+
+    Parameters
+    ----------
+    x_data : array, shape (M,)
+        Uniformly spaced sample points.
+    y_data : array, shape (M,)
+        Noisy observations f(x_m) + epsilon.
+    K : int
+        Number of exponential components.
+
+    Returns
+    -------
+    f_recon : array, shape (M,)
+        Reconstructed function values at x_data.
+    c_est : float
+        Estimated additive constant.
     """
     dx = x_data[1] - x_data[0]
+    M = len(y_data)
 
-    # --- FIX 1: Pre-smooth the data to handle higher noise ---
-    # A Savitzky-Golay filter removes high-frequency noise that would otherwise
-    # cause wild oscillations when calculating the analytical derivative later.
-    window_length = len(y_data) // 4
+    # Pre-smooth
+    window_length = M // 4
     if window_length % 2 == 0:
-        window_length += 1 # Window length must be odd
+        window_length += 1
     y_smooth = savgol_filter(y_data, window_length=window_length, polyorder=3)
 
-    # --- FIX 2: Shift X-axis to start at 0 to prevent exp() overflow ---
+    # Shift x-axis to start at 0
     x0 = x_data[0]
     x_shifted = x_data - x0
 
-    # 1. Run ESPRIT on the SMOOTHED data
-    t, w = esprit(y_smooth, K, dx)
+    # Differences to remove constant c
+    g = np.diff(y_smooth)
 
-    # 2. Reconstruct the smoothed function and its analytical derivative
+    # ESPRIT on differences
+    t, W = esprit(g, K, dx)
+    print(f"t={t}")
+    print(f"W={W}")
+    # Recover weights a_j from differenced weights W_j
+    w_shifted = W / (np.exp(t * dx) - 1)
+
+    # Reconstruct f(x') - c
     V_recon = np.exp(np.outer(x_shifted, t))
-    f_recon = np.real(V_recon @ w)
-    df_recon = np.real(V_recon @ (w * t))
+    f_minus_c = np.real(V_recon @ w_shifted)
 
-    # 3. Extract parameters using the differential equation:
-    # f(x) = c + (xc_shifted / gamma) * f'(x) - (1 / gamma) * x * f'(x)
-    X1 = df_recon
-    X2 = x_shifted * df_recon
+    # Estimate c from residuals
+    c_est = np.mean(y_data - f_minus_c)
 
-    A_mat = np.column_stack((np.ones_like(x_shifted), X1, X2))
-    beta, _, _, _ = np.linalg.lstsq(A_mat, f_recon, rcond=None)
+    f_recon = f_minus_c + c_est
 
-    c_est = beta[0]
-    gamma_est = -1.0 / beta[2]
-    xc_shifted_est = beta[1] * gamma_est
-
-    # Unshift xc to get the true critical point
-    xc_est = xc_shifted_est + x0
-
-    # Calculate RMS error of the fit against the original noisy data
-    rms = np.sqrt(np.mean((y_data - f_recon)**2))
-
-    return xc_est, gamma_est, c_est, f_recon, df_recon, rms
+    return f_recon, c_est
 
 
-# --- Configuration ---
+
+# ================================================================
+# Configuration
+# ================================================================
 xc_true = 1.0
 gamma_true = 0.5
 c_true = 2.0
-sigma = 0.001  # Increased noise to 0.01
+A_true = 1.0
+sigma = 0.001
 M = 400
+K = 2
 
 x = np.linspace(0.8, 0.9, M)
-np.random.seed(42) # For reproducibility
-y = generate_data(x, xc_true, gamma_true, c_true, A=1.0, sigma=sigma)
+np.random.seed(42)
+y_noisy = generate_data(x, xc_true, gamma_true, c_true, A=A_true, sigma=sigma)
+y_exact = A_true * (xc_true - x)**(-gamma_true) + c_true
 
-print("============================================================")
-print(f"True Parameters: xc = {xc_true}, gamma = {gamma_true}, c = {c_true}")
-print(f"Noise Level (sigma) = {sigma}")
-print("============================================================\n")
+# ================================================================
+# Reconstruct
+# ================================================================
+f_recon, c_est = reconstruct_f(x, y_noisy, K)
+rms = np.sqrt(np.mean((y_noisy - f_recon)**2))
 
-print("--- Sweep over K ---")
-print(f"{'K':<5} {'xc_est':<12} {'gamma_est':<12} {'c_est':<12} {'RMS':<12}")
-K_end=10
-best_K = 4
-best_f_recon = None
-best_df_recon = None
-best_c_est = None
-best_xc_est = None
-best_gamma_est = None
+print(f"True c = {c_true},  Estimated c = {c_est:.6f}")
+print(f"RMS reconstruction error = {rms:.2e}")
 
-# Sweep K from 2 to 6
-for K in range(2, K_end):
-    try:
-        xc_est, gamma_est, c_est, f_recon, df_recon, rms = fit_singularity(x, y, K)
-        print(f"{K:<5} {xc_est:<12.6f} {gamma_est:<12.6f} {c_est:<12.6f} {rms:<12.2e}\n")
-        if K == best_K:
-            best_f_recon = f_recon
-            best_df_recon = df_recon
-            best_c_est = c_est
-            best_xc_est = xc_est
-            best_gamma_est = gamma_est
-    except Exception as e:
-        print(f"{K:<5} FAILED: {e}\n")
+# ================================================================
+# Plot
+# ================================================================
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-# --- Plotting ---
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-# Plot 1: The function fit
-ax1.plot(x, y, '.', label='Noisy Data ($\\sigma=0.01$)', alpha=0.3)
-y_exact = generate_data(x, xc_true, gamma_true, c_true, sigma=0)
-ax1.plot(x, y_exact, 'k--', label='True Function')
-
-if best_f_recon is not None:
-    ax1.plot(x, best_f_recon, 'r-', linewidth=2, label=f'ESPRIT Fit (K={best_K})')
-
+# --- Panel 1: Function fit ---
+ax1 = axes[0]
+ax1.plot(x, y_noisy, '.', color='grey', alpha=0.3, markersize=2,
+         label=f'Noisy data ($\\sigma={sigma}$)')
+ax1.plot(x, y_exact, 'k--', lw=1.5, label='True $f(x)$')
+ax1.plot(x, f_recon, 'r-', lw=2, label=f'ESPRIT reconstruction (K={K})')
 ax1.set_xlabel('x')
 ax1.set_ylabel('f(x)')
-ax1.set_title('Singularity Fitting using ESPRIT (with Pre-smoothing)')
+ax1.set_title('Function Reconstruction')
 ax1.legend()
 ax1.grid(True)
 
-# Plot 2: The ratio (f - c) / f'
-# True ratio: (xc - x) / gamma
-true_ratio = (xc_true - x) / gamma_true
-ax2.plot(x, true_ratio, 'k--', label=f'True Ratio: $(x_c - x) / \\gamma$\n($x_c={xc_true}$, $\\gamma={gamma_true}$)')
-
-if best_f_recon is not None and best_df_recon is not None:
-    # Reconstructed ratio: (f_recon - c_est) / df_recon
-    recon_ratio = (best_f_recon - best_c_est) / best_df_recon
-
-    # Add the estimated parameters to the label
-    label_str = f'Reconstructed Ratio (K={best_K})\nEst: $x_c={best_xc_est:.4f}$, $\\gamma={best_gamma_est:.4f}$'
-    ax2.plot(x, recon_ratio, 'r-', linewidth=2, label=label_str)
-
+# --- Panel 2: Residual ---
+ax2 = axes[1]
+residual = y_noisy - f_recon
+ax2.plot(x, residual, '.', color='steelblue', alpha=0.4, markersize=2)
+ax2.axhline(0, color='k', ls='--', lw=0.8)
 ax2.set_xlabel('x')
-ax2.set_ylabel('$(f(x) - c) / f\'(x)$')
-ax2.set_title('Linearization of the Singularity')
-ax2.legend()
+ax2.set_ylabel('$y_{\\mathrm{noisy}} - f_{\\mathrm{recon}}$')
+ax2.set_title(f'Residuals  (RMS = {rms:.2e})')
 ax2.grid(True)
 
 plt.tight_layout()
-plt.savefig("critical_exponent_fit_robust.png")
-print("\nFigure saved to critical_exponent_fit_robust.png")
+plt.savefig("reconstruct_f.png", dpi=150)
+print("\nFigure saved to reconstruct_f.png")
 # plt.show()
